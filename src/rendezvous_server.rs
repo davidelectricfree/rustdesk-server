@@ -595,14 +595,62 @@ impl RendezvousServer {
                     msg_out.set_test_nat_response(res);
                     Self::send_to_sink(sink, msg_out).await;
                 }
-                Some(rendezvous_message::Union::RegisterPk(_)) => {
-                    let res = register_pk_response::Result::NOT_SUPPORT;
-                    let mut msg_out = RendezvousMessage::new();
-                    msg_out.set_register_pk_response(RegisterPkResponse {
-                        result: res.into(),
-                        ..Default::default()
-                    });
-                    Self::send_to_sink(sink, msg_out).await;
+                Some(rendezvous_message::Union::RegisterPk(rk)) => {
+                    let response = self.handle_register_pk(rk, addr, ws).await;
+                    match response {
+                        Err(err) => {
+                            let mut msg_out = RendezvousMessage::new();
+                            msg_out.set_register_pk_response(RegisterPkResponse {
+                                result: err.into(),
+                                ..Default::default()
+                            });
+                            Self::send_to_sink(sink, msg_out).await;
+                            return false;
+                        }
+                        Ok(res) => {
+                            let mut msg_out = RendezvousMessage::new();
+                            msg_out.set_register_pk_response(RegisterPkResponse {
+                                result: res.into(),
+                                ..Default::default()
+                            });
+                            Self::send_to_sink(sink, msg_out).await;
+                            return true;
+                        }
+                    }
+                }
+                Some(rendezvous_message::Union::KeyExchange(ex)) => {
+                    log::trace!("KeyExchange {:?} <- bytes: {:?}", addr, hex::encode(&bytes));
+                    if ex.keys.len() != 2 {
+                        log::error!("Handshake failed: invalid phase 2 key exchange message");
+                        return false;
+                    }
+                    log::trace!("KeyExchange their_pk: {:?}", hex::encode(&ex.keys[0]));
+                    log::trace!("KeyExchange box: {:?}", hex::encode(&ex.keys[1]));
+                    let their_pk: [u8; 32] = ex.keys[0].to_vec().try_into().unwrap();
+                    let cryptobox: [u8; 48] = ex.keys[1].to_vec().try_into().unwrap();
+                    let symetric_key = get_symetric_key_from_msg(
+                        self.inner.secure_tcp_sk_b.0,
+                        their_pk,
+                        &cryptobox,
+                    );
+                    log::debug!("KeyExchange symetric key: {:?}", hex::encode(&symetric_key));
+                    let key = secretbox::Key::from_slice(&symetric_key);
+                    match key {
+                        Some(key) => {
+                            if let Some(sink) = sink.as_mut() {
+                                match sink {
+                                    Sink::Wss(s) => s.encrypt = Some(Encrypt::new(key)),
+                                    Sink::Tss(s) => s.encrypt = Some(Encrypt::new(key)),
+                                }
+                            }
+                            log::debug!("KeyExchange symetric key set");
+                            return true;
+                        }
+                        None => {
+                            log::error!("KeyExchange symetric key NOT set");
+                            return false;
+                        }
+                    }
                 }
                 _ => {}
             }
@@ -1321,6 +1369,117 @@ impl RendezvousServer {
         }
         false
     }
+
+    async fn handle_register_pk(
+        &mut self,
+        rk: RegisterPk,
+        addr: SocketAddr,
+        _ws: bool,
+    ) -> Result<register_pk_response::Result, register_pk_response::Result> {
+        if rk.uuid.is_empty() || rk.pk.is_empty() {
+            return Err(INVALID_ID_FORMAT);
+        }
+        let id = rk.id;
+        let ip = addr.ip().to_string();
+        if id.len() < 6 {
+            return Err(UUID_MISMATCH);
+        } else if !self.check_ip_blocker(&ip, &id).await {
+            return Err(TOO_FREQUENT);
+        }
+        let peer = self.pm.get_or(&id).await;
+        let (changed, ip_changed) = {
+            let peer = peer.read().await;
+            if peer.uuid.is_empty() {
+                (true, false)
+            } else {
+                if peer.uuid == rk.uuid {
+                    if peer.info.ip != ip && peer.pk != rk.pk {
+                        log::warn!(
+                            "Peer {} ip/pk mismatch: {}/{:?} vs {}/{:?}",
+                            id,
+                            ip,
+                            rk.pk,
+                            peer.info.ip,
+                            peer.pk,
+                        );
+                        drop(peer);
+                        return Err(UUID_MISMATCH);
+                    }
+                } else {
+                    log::warn!(
+                        "Peer {} uuid mismatch: {:?} vs {:?}",
+                        id,
+                        rk.uuid,
+                        peer.uuid
+                    );
+                    drop(peer);
+                    return Err(UUID_MISMATCH);
+                }
+                let ip_changed = peer.info.ip != ip;
+                (
+                    peer.uuid != rk.uuid || peer.pk != rk.pk || ip_changed,
+                    ip_changed,
+                )
+            }
+        };
+        let mut req_pk = peer.read().await.reg_pk;
+        if req_pk.1.elapsed().as_secs() > 6 {
+            req_pk.0 = 0;
+        } else if req_pk.0 > 2 {
+            return Err(TOO_FREQUENT);
+        }
+        req_pk.0 += 1;
+        req_pk.1 = Instant::now();
+        peer.write().await.reg_pk = req_pk;
+        if ip_changed {
+            let mut lock = IP_CHANGES.lock().await;
+            if let Some((tm, ips)) = lock.get_mut(&id) {
+                if tm.elapsed().as_secs() > IP_CHANGE_DUR {
+                    *tm = Instant::now();
+                    ips.clear();
+                    ips.insert(ip.clone(), 1);
+                } else if let Some(v) = ips.get_mut(&ip) {
+                    *v += 1;
+                } else {
+                    ips.insert(ip.clone(), 1);
+                }
+            } else {
+                lock.insert(
+                    id.clone(),
+                    (Instant::now(), HashMap::from([(ip.clone(), 1)])),
+                );
+            }
+        }
+        if changed {
+            self.pm.update_pk(id, peer, addr, rk.uuid, rk.pk, ip).await;
+        }
+        Ok(register_pk_response::Result::OK)
+    }
+
+    async fn key_exchange_phase1(&mut self, addr: SocketAddr, sink: &mut Option<Sink>) {
+        let mut msg_out = RendezvousMessage::new();
+        log::debug!("KeyExchange phase 1: send our pk for this tcp connection in a message signed with our server key");
+        let sk = &self.inner.sk;
+        match sk {
+            Some(sk) => {
+                let our_pk_b = self.inner.secure_tcp_pk_b.clone();
+                let sm = sign::sign(&our_pk_b.0, &sk);
+
+                let bytes_sm = Bytes::from(sm);
+                msg_out.set_key_exchange(KeyExchange {
+                    keys: vec![bytes_sm],
+                    ..Default::default()
+                });
+                log::trace!(
+                    "KeyExchange {:?} -> bytes: {:?}",
+                    addr,
+                    hex::encode(Bytes::from(msg_out.write_to_bytes().unwrap()))
+                );
+                Self::send_to_sink(sink, msg_out).await;
+            }
+            None => {}
+        }
+    }
 }
 
 async fn check_relay_servers(rs0: Arc<RelayServers>, tx: Sender) {
@@ -1419,4 +1578,23 @@ async fn create_tcp_listener(port: i32) -> ResultType<TcpListener> {
     let s = listen_any(port as _).await?;
     log::debug!("listen on tcp {:?}", s.local_addr());
     Ok(s)
+}
+
+fn get_symetric_key_from_msg(
+    our_sk_b: [u8; 32],
+    their_pk_b: [u8; 32],
+    sealed_value: &[u8; 48],
+) -> [u8; 32] {
+    let their_pk_b = box_::PublicKey(their_pk_b);
+    let nonce = box_::Nonce([0u8; box_::NONCEBYTES]);
+    let sk = box_::SecretKey(our_sk_b);
+    let key = box_::open(sealed_value, &nonce, &their_pk_b, &sk);
+    match key {
+        Ok(key) => {
+            let mut key_array = [0u8; 32];
+            key_array.copy_from_slice(&key);
+            key_array
+        }
+        Err(e) => panic!("Error while opening the seal key{:?}", e),
+    }
 }
