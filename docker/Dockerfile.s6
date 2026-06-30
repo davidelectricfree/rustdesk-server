@@ -1,0 +1,13 @@
+# 基于 lejianwen/rustdesk-server-s6 镜像（已包含 S6-overlay + hbbs + hbbr + API + Web 管理）
+# 仅替换 hbbs/hbbr 为我们的 secure_tcp 补丁版本
+FROM lejianwen/rustdesk-server-s6:latest
+
+COPY hbbs /usr/bin/hbbs
+COPY hbbr /usr/bin/hbbr
+
+# 继承 base 镜像的所有配置:
+# - S6-overlay 管理所有进程 (hbbs, hbbr, api, key-secret)
+# - WORKDIR /app (API), /data (hbbs/hbbr)
+# - ENTRYPOINT ["/init"]
+# - 端口: 21114(API), 21115-21119(hbbs/hbbr)
+# - ENV: RELAY, ENCRYPTED_ONLY
