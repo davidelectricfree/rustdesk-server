@@ -23,8 +23,11 @@ COPY Cargo.toml .
 COPY Cargo.lock .
 
 # Build release binaries
-# DATABASE_URL is needed by sqlx compile-time query macros (query!/query_as!)
-ENV DATABASE_URL=sqlite:/build/sqlx-build.db
+# sqlx compile-time query macros (query!/query_as!) need DATABASE_URL to verify SQL.
+# The official CI uses `cross` which handles this, but in plain Docker we need to
+# provide a sqlite file that actually exists.
+RUN touch /build/sqlx-build.db
+ENV DATABASE_URL=sqlite:///build/sqlx-build.db
 RUN cargo build --release && \
     strip target/release/hbbs && \
     strip target/release/hbbr
