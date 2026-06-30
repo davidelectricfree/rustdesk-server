@@ -1,7 +1,7 @@
 name: Build Patched (secure_tcp)
 
-# Build and push Docker image for patched rustdesk-server with secure_tcp support.
-# Triggered by tagging a version like "1.1.15-patched1"
+# lejianwen 模式: 用 cross 编译源码 + 简单 Docker 打包
+# 避免在 Docker 内编译（sqlx 需要运行时数据库连接验证 SQL）
 
 on:
   workflow_dispatch:
@@ -10,48 +10,88 @@ on:
       - '*patched*'
 
 env:
-  GHCR_IMAGE: ghcr.io/davidelectricfree/rustdesk-server-patched
+  CARGO_TERM_COLOR: always
 
 permissions:
   contents: read
   packages: write
 
 jobs:
-  build-and-push:
-    name: Build and push patched image
-    runs-on: ubuntu-22.04
-
+  # ====== 第一步：用 cross 编译（lejianwen 的方式） ======
+  build:
+    name: Build with cross
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           submodules: recursive
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
+          targets: x86_64-unknown-linux-musl
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cross
+        run: cargo install cross
+
+      - name: Build with cross
+        run: cross build --release --all-features --target=x86_64-unknown-linux-musl
+
+      - name: Strip and verify binaries
+        run: |
+          strip target/x86_64-unknown-linux-musl/release/hbbs
+          strip target/x86_64-unknown-linux-musl/release/hbbr
+          chmod -v a+x target/x86_64-unknown-linux-musl/release/*
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: binaries-linux-amd64
+          path: |
+            target/x86_64-unknown-linux-musl/release/hbbs
+            target/x86_64-unknown-linux-musl/release/hbbr
+          if-no-files-found: error
+
+  # ====== 第二步：简单的 Docker 打包（不编译，只 COPY） ======
+  docker:
+    name: Build and push Docker image
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: binaries-linux-amd64
+          path: docker
+
+      - name: Make binaries executable
+        run: chmod -v a+x docker/*
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Log in to GHCR
+      - name: Log in to GitHub Container Registry
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
-          username: davidelectricfree
+          username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract tag name
-        id: tag
-        run: echo "TAG=${GITHUB_REF#refs/*/}" >> $GITHUB_ENV
-
       - name: Build and push Docker image
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v6
         with:
-          context: ./
+          context: ./docker
           file: ./docker/Dockerfile.build
           platforms: linux/amd64
           push: true
           provenance: false
           tags: |
-            ${{ env.GHCR_IMAGE }}:${{ env.TAG }}
-            ${{ env.GHCR_IMAGE }}:latest
+            ghcr.io/${{ github.repository }}-patched:latest
+            ghcr.io/${{ github.repository }}-patched:${{ github.ref_name }}
