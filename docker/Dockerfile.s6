@@ -5,6 +5,8 @@ FROM lejianwen/rustdesk-server-s6:latest
 COPY hbbs /usr/bin/hbbs
 COPY hbbr /usr/bin/hbbr
 
+RUN chmod +x /usr/bin/hbbs /usr/bin/hbbr
+
 # 继承 base 镜像的所有配置:
 # - S6-overlay 管理所有进程 (hbbs, hbbr, api, key-secret)
 # - WORKDIR /app (API), /data (hbbs/hbbr)
