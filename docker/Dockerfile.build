@@ -11,6 +11,7 @@ RUN apt-get update && apt-get install -y \
     autoconf \
     automake \
     libtool \
+    sqlite3 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
@@ -23,10 +24,25 @@ COPY Cargo.toml .
 COPY Cargo.lock .
 
 # Build release binaries
-# sqlx compile-time query macros (query!/query_as!) need DATABASE_URL to verify SQL.
-# The official CI uses `cross` which handles this, but in plain Docker we need to
-# provide a sqlite file that actually exists.
-RUN touch /build/sqlx-build.db
+# sqlx compile-time macros (query!/query_as!) execute SQL against a real database
+# to verify queries at compile time. We create a sqlite db with the peer table
+# schema matching database.rs so these checks pass.
+RUN sqlite3 /build/sqlx-build.db \
+    "CREATE TABLE IF NOT EXISTS peer ( \
+        guid BLOB PRIMARY KEY NOT NULL, \
+        id VARCHAR(100) NOT NULL, \
+        uuid BLOB NOT NULL, \
+        pk BLOB NOT NULL, \
+        created_at DATETIME NOT NULL DEFAULT(current_timestamp), \
+        user BLOB, \
+        status TINYINT, \
+        note VARCHAR(300), \
+        info TEXT NOT NULL \
+    ) WITHOUT ROWID; \
+    CREATE UNIQUE INDEX IF NOT EXISTS index_peer_id ON peer (id); \
+    CREATE INDEX IF NOT EXISTS index_peer_user ON peer (user); \
+    CREATE INDEX IF NOT EXISTS index_peer_created_at ON peer (created_at); \
+    CREATE INDEX IF NOT EXISTS index_peer_status ON peer (status);"
 ENV DATABASE_URL=sqlite:///build/sqlx-build.db
 RUN cargo build --release && \
     strip target/release/hbbs && \
