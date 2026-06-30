@@ -1,6 +1,5 @@
 use crate::common::*;
 use crate::peer::*;
-use hbb_common::bytes::BufMut;
 use hbb_common::{
     allow_err, bail,
     bytes::{Bytes, BytesMut},
@@ -18,7 +17,7 @@ use hbb_common::{
         *,
     },
     sodiumoxide::crypto::{
-        box_, box_::PublicKey, box_::SecretKey, secretbox, secretbox::Key, secretbox::Nonce, sign,
+        box_, box_::PublicKey, box_::SecretKey, secretbox, sign,
     },
     sodiumoxide::hex,
     tcp::Encrypt,
@@ -37,7 +36,6 @@ use hbb_common::{
     AddrMangle, ResultType,
 };
 use ipnetwork::Ipv4Network;
-use std::io::Error;
 use std::{
     collections::HashMap,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},

@@ -23,6 +23,8 @@ COPY Cargo.toml .
 COPY Cargo.lock .
 
 # Build release binaries
+# DATABASE_URL is needed by sqlx compile-time query macros (query!/query_as!)
+ENV DATABASE_URL=sqlite:/build/sqlx-build.db
 RUN cargo build --release && \
     strip target/release/hbbs && \
     strip target/release/hbbr
